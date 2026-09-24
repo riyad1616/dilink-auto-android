@@ -1,1 +1,30 @@
-github.com/riyad1616/dilink-auto-android/edit/develop/.github/workflows/build-android9.yml
+name: Build Android 9 APKs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: |
+          chmod +x gradlew
+          ./gradlew :app-client:assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: car-app-server-debug
+          path: app-server/build/outputs/apk/debug/app-server-debug.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phone-app-client-debug
+          path: app-client/build/outputs/apk/debug/app-client-debug.apk
