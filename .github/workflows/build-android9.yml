@@ -1,0 +1,45 @@
+name: Build Android 9 APKs
+
+# Manual run: Actions tab -> "Build Android 9 APKs" -> Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build car (server) + phone (client) debug APKs
+        run: |
+          chmod +x gradlew
+          ./gradlew :app-client:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload car APK (Android 9 compatible)
+        uses: actions/upload-artifact@v4
+        with:
+          name: car-app-server-debug
+          path: app-server/build/outputs/apk/debug/app-server-debug.apk
+
+      - name: Upload phone APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: phone-app-client-debug
+          path: app-client/build/outputs/apk/debug/app-client-debug.apk
