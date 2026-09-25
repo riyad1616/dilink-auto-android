@@ -1,30 +1,398 @@
-name: Build Android 9 APKs
+import os, zipfile, urllib.request, subprocess, platform
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [develop]
+PROJECT = "GeelyMirrorPro_WiFi"
 
+FILES = {
+"settings.gradle": """
+include \':PhoneSender\'
+include \':CarReceiver\'
+""",
+
+"build.gradle": """
+plugins {
+    id \'com.android.application\' version \'8.2.0\' apply false
+    id \'org.jetbrains.kotlin.android\' version \'1.9.10\' apply false
+}
+""",
+
+# ===== PhoneSender =====
+"PhoneSender/build.gradle": """
+plugins { id \'com.android.application\'; id \'org.jetbrains.kotlin.android\' }
+android {
+    namespace \'com.geelymirror.phone\'
+    compileSdk 34
+    defaultConfig { applicationId "com.geelymirror.phone"; minSdk 23; targetSdk 34; versionCode 1; versionName "1.0" }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
+    kotlinOptions { jvmTarget = \'1.8\' }
+}
+dependencies {
+    implementation \'androidx.core:core-ktx:1.12.0\'
+    implementation \'androidx.appcompat:appcompat:1.6.1\'
+}
+""",
+
+"PhoneSender/src/main/AndroidManifest.xml": """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+    <application android:allowBackup="true" android:label="Geely Mirror Pro" android:icon="@mipmap/ic_launcher">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+        </activity>
+        <service android:name=".ScreenCaptureService" android:foregroundServiceType="mediaProjection"/>
+        <service android:name=".TouchInjectService" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE" android:exported="true">
+            <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config"/>
+        </service>
+    </application>
+</manifest>
+""",
+
+"PhoneSender/src/main/res/layout/activity_main.xml": """<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:orientation="vertical" android:gravity="center" android:padding="24dp" android:layout_width="match_parent" android:layout_height="match_parent">
+    <TextView android:text="Geely Mirror Pro" android:textSize="26sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+    <TextView android:text="عكس شاشة الهاتف WiFi لسيارة Geely Coolray" android:layout_marginTop="8dp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+    <EditText android:id="@+id/editIp" android:hint="ادخل IP السيارة مثلا 192.168.43.12" android:inputType="phone" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="24dp"/>
+    <Button android:id="@+id/btnStart" android:text="بدء العكس WiFi" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="16dp"/>
+    <TextView android:text="مهم: فعل خدمة امكانية الوصول للتحكم من شاشة السيارة" android:textSize="12sp" android:layout_marginTop="16dp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+</LinearLayout>
+""",
+
+"PhoneSender/src/main/res/xml/accessibility_config.xml": """<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android" android:canPerformGestures="true" android:accessibilityFlags="flagIncludeNotImportantViews" android:accessibilityFeedbackType="feedbackGeneric"/>
+""",
+
+"PhoneSender/src/main/java/com/geelymirror/phone/MainActivity.kt": """package com.geelymirror.phone
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Bundle
+import android.widget.Button
+import android.widget.EditText
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+class MainActivity : AppCompatActivity() {
+    private val REQ_CODE = 1001
+    private lateinit var manager: MediaProjectionManager
+    override fun onCreate(s: Bundle?) {
+        super.onCreate(s)
+        setContentView(R.layout.activity_main)
+        manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        findViewById<Button>(R.id.btnStart).setOnClickListener {
+            val ip = findViewById<EditText>(R.id.editIp).text.toString().trim()
+            if(ip.isEmpty()){ Toast.makeText(this,"ادخل IP السيارة",0).show(); return@setOnClickListener }
+            getSharedPreferences("prefs", MODE_PRIVATE).edit().putString("car_ip", ip).apply()
+            startActivityForResult(manager.createScreenCaptureIntent(), REQ_CODE)
+        }
+    }
+    override fun onActivityResult(c:Int, r:Int, d:Intent?){
+        super.onActivityResult(c,r,d)
+        if(c==REQ_CODE && r==Activity.RESULT_OK && d!=null){
+            val i = Intent(this, ScreenCaptureService::class.java).apply{ putExtra("code",r); putExtra("data",d) }
+            if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+        }
+    }
+}
+""",
+
+"PhoneSender/src/main/java/com/geelymirror/phone/ScreenCaptureService.kt": """package com.geelymirror.phone
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.IBinder
+import java.io.DataOutputStream
+import java.net.ServerSocket
+import java.net.Socket
+class ScreenCaptureService : Service() {
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var encoder: MediaCodec? = null
+    override fun onStartCommand(intent: Intent?, f:Int, id:Int): Int {
+        createNotification()
+        val code = intent!!.getIntExtra("code", -1)
+        val data = intent.getParcelableExtra<Intent>("data")!!
+        val carIp = getSharedPreferences("prefs", MODE_PRIVATE).getString("car_ip","")!!
+        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = mgr.getMediaProjection(code, data)
+        startStreaming(carIp)
+        startTouchServer()
+        return START_STICKY
+    }
+    private fun createNotification(){
+        val chId = "mirror_channel"
+        if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
+            val ch = NotificationChannel(chId, "Geely Mirror", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+        val notif = if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(this, chId).setContentTitle("Geely Mirror Pro").setContentText("يتم عكس الشاشة...").setSmallIcon(android.R.drawable.ic_media_play).build()
+        else Notification.Builder(this).setContentTitle("Geely Mirror Pro").setContentText("يتم عكس الشاشة...").setSmallIcon(android.R.drawable.ic_media_play).build()
+        startForeground(1, notif)
+    }
+    private fun startStreaming(ip: String){
+        Thread{
+            try{
+                val socket = Socket(ip, 8080)
+                val out = DataOutputStream(socket.getOutputStream())
+                val format = MediaFormat.createVideoFormat("video/avc", 1280, 720)
+                format.setInteger(MediaFormat.KEY_BIT_RATE, 2000000)
+                format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+                format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                encoder = MediaCodec.createEncoderByType("video/avc")
+                encoder!!.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                val surface = encoder!!.createInputSurface()
+                encoder!!.start()
+                virtualDisplay = mediaProjection!!.createVirtualDisplay("GeelyMirror",1280,720,240, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null)
+                val info = MediaCodec.BufferInfo()
+                while(true){
+                    val idx = encoder!!.dequeueOutputBuffer(info, 10000)
+                    if(idx >= 0){
+                        val buf = encoder!!.getOutputBuffer(idx)!!
+                        val arr = ByteArray(info.size)
+                        buf.get(arr)
+                        out.writeInt(arr.size)
+                        out.write(arr)
+                        encoder!!.releaseOutputBuffer(idx, false)
+                    }
+                }
+            }catch(e:Exception){ e.printStackTrace() }
+        }.start()
+    }
+    private fun startTouchServer(){
+        Thread{
+            try{
+                val server = ServerSocket(8081)
+                while(true){
+                    val c = server.accept()
+                    val data = c.getInputStream().bufferedReader().readLine() ?: continue
+                    val parts = data.split(",")
+                    if(parts.size==3){
+                        val x = parts[0].toFloat()
+                        val y = parts[1].toFloat()
+                        val w = resources.displayMetrics.widthPixels
+                        val h = resources.displayMetrics.heightPixels
+                        TouchInjectService.instance?.click(x*w, y*h)
+                    }
+                    c.close()
+                }
+            }catch(e:Exception){}
+        }.start()
+    }
+    override fun onBind(i: Intent?): IBinder? = null
+}
+""",
+
+"PhoneSender/src/main/java/com/geelymirror/phone/TouchInjectService.kt": """package com.geelymirror.phone
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.graphics.Path
+import android.view.accessibility.AccessibilityEvent
+class TouchInjectService : AccessibilityService() {
+    companion object { var instance: TouchInjectService? = null }
+    override fun onServiceConnected() { instance = this; super.onServiceConnected() }
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    override fun onInterrupt() {}
+    fun click(x: Float, y: Float){
+        val path = Path().apply{ moveTo(x, y) }
+        val gesture = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 100)).build()
+        dispatchGesture(gesture, null, null)
+    }
+}
+""",
+
+# ===== CarReceiver =====
+"CarReceiver/build.gradle": """
+plugins { id \'com.android.application\'; id \'org.jetbrains.kotlin.android\' }
+android {
+    namespace \'com.geelymirror.car\'
+    compileSdk 34
+    defaultConfig { applicationId "com.geelymirror.car"; minSdk 21; targetSdk 34; versionCode 1; versionName "1.0" }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
+    kotlinOptions { jvmTarget = \'1.8\' }
+}
+dependencies {
+    implementation \'androidx.core:core-ktx:1.12.0\'
+    implementation \'androidx.appcompat:appcompat:1.6.1\'
+}
+""",
+
+"CarReceiver/src/main/AndroidManifest.xml": """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <application android:allowBackup="true" android:label="Geely Mirror Pro - Car" android:icon="@mipmap/ic_launcher">
+        <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="landscape">
+            <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+        </activity>
+    </application>
+</manifest>
+""",
+
+"CarReceiver/src/main/java/com/geelymirror/car/MainActivity.kt": """package com.geelymirror.car
+import android.media.MediaCodec
+import android.media.MediaFormat
+import android.net.wifi.WifiManager
+import android.os.Bundle
+import android.text.format.Formatter
+import android.view.Gravity
+import android.view.SurfaceView
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import java.io.DataInputStream
+import java.net.ServerSocket
+import java.net.Socket
+class MainActivity : AppCompatActivity() {
+    lateinit var surfaceView: SurfaceView
+    var decoder: MediaCodec? = null
+    var phoneIp: String = ""
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        val layout = LinearLayout(this).apply{ orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
+        val ipText = TextView(this).apply{ textSize = 18f; gravity = Gravity.CENTER; setPadding(20,20,20,20) }
+        surfaceView = SurfaceView(this)
+        layout.addView(ipText)
+        layout.addView(surfaceView, LinearLayout.LayoutParams(-1,-1))
+        setContentView(layout)
+        val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+        val ip = Formatter.formatIpAddress(wm.connectionInfo.ipAddress)
+        ipText.text = "IP السيارة هو:\\n"+ip+"\\n\\nادخل هذا الرقم في تطبيق الهاتف"
+        startServer(ipText)
+        surfaceView.setOnTouchListener { _, e ->
+            sendTouch(e.x / surfaceView.width, e.y / surfaceView.height, e.action)
+            true
+        }
+    }
+    private fun startServer(ipText: TextView){
+        Thread{
+            try{
+                val server = ServerSocket(8080)
+                runOnUiThread{ ipText.text = ipText.text.toString() + "\\nجاهز على المنفذ 8080"}
+                val client = server.accept()
+                phoneIp = client.inetAddress.hostAddress ?: ""
+                runOnUiThread{ ipText.text = "متصل بالهاتف: "+phoneIp }
+                val input = DataInputStream(client.getInputStream())
+                decoder = MediaCodec.createDecoderByType("video/avc")
+                val format = MediaFormat.createVideoFormat("video/avc", 1280, 720)
+                decoder!!.configure(format, surfaceView.holder.surface, null, 0)
+                decoder!!.start()
+                val info = MediaCodec.BufferInfo()
+                while(true){
+                    val len = input.readInt()
+                    val data = ByteArray(len)
+                    input.readFully(data)
+                    val idx = decoder!!.dequeueInputBuffer(10000)
+                    if(idx >=0){
+                        decoder!!.getInputBuffer(idx)!!.put(data)
+                        decoder!!.queueInputBuffer(idx, 0, len, System.nanoTime()/1000, 0)
+                    }
+                    val outIdx = decoder!!.dequeueOutputBuffer(info, 10000)
+                    if(outIdx >=0) decoder!!.releaseOutputBuffer(outIdx, true)
+                }
+            }catch(e:Exception){ e.printStackTrace() }
+        }.start()
+    }
+    private fun sendTouch(x:Float, y:Float, a:Int){
+        Thread{
+            try{
+                if(phoneIp.isEmpty()) return@Thread
+                val s = Socket(phoneIp, 8081)
+                s.getOutputStream().write("$x,$y,$a".toByteArray())
+                s.close()
+            }catch(e:Exception){}
+        }.start()
+    }
+}
+""",
+
+".github/workflows/build.yml": """name: Build Geely Mirror APKs
+on: [push]
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
-        with:
-          java-version: "17"
-          distribution: "temurin"
-      - name: Accept SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-      - uses: gradle/actions/setup-gradle@v4
-      - run: |
-          chmod +x gradlew
-          ./gradlew :app-client:assembleDebug --no-daemon --stacktrace
+        with: { java-version: \'17\', distribution: \'temurin\' }
+      - name: Build Phone APK
+        run: |
+          cd PhoneSender
+          chmod +x gradlew || gradle wrapper
+          ./gradlew assembleDebug
+      - name: Build Car APK
+        run: |
+          cd CarReceiver
+          chmod +x gradlew || gradle wrapper
+          ./gradlew assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: car-app-server-debug
-          path: app-server/build/outputs/apk/debug/app-server-debug.apk
-      - uses: actions/upload-artifact@v4
-        with:
-          name: phone-app-client-debug
-          path: app-client/build/outputs/apk/debug/app-client-debug.apk
+          name: GeelyMirror-APKs
+          path: |
+            PhoneSender/build/outputs/apk/debug/*.apk
+            CarReceiver/build/outputs/apk/debug/*.apk
+""",
+
+"build.py": """
+import os, subprocess, platform, urllib.request, zipfile
+GRADLE_VERSION = "8.4"
+def download_gradle():
+    if os.path.exists("gradle"): return
+    print("⬇️ جاري تحميل Gradle...")
+    url = f"https://services.gradle.org/distributions/gradle-{GRADLE_VERSION}-bin.zip"
+    urllib.request.urlretrieve(url, "gradle.zip")
+    with zipfile.ZipFile("gradle.zip", \'r\') as z: z.extractall(".")
+    os.rename(f"gradle-{GRADLE_VERSION}", "gradle")
+    os.remove("gradle.zip")
+def build():
+    download_gradle()
+    gradle_cmd = os.path.join("gradle", "bin", "gradle.bat" if platform.system()=="Windows" else "gradle")
+    for module in ["PhoneSender", "CarReceiver"]:
+        print(f"\\n🔨 جاري بناء {module}...")
+        if not os.path.exists(os.path.join(module, "gradlew")):
+            subprocess.run([gradle_cmd, "wrapper"], cwd=module, shell=True)
+        cmd = "gradlew.bat assembleDebug" if platform.system()=="Windows" else "./gradlew assembleDebug"
+        subprocess.run(cmd, cwd=module, shell=True)
+        apk_path = os.path.join(module, "build", "outputs", "apk", "debug", "app-debug.apk")
+        if not os.path.exists(apk_path):
+            apk_path = os.path.join(module, "build", "outputs", "apk", "debug", module+"-debug.apk")
+        new_name = f"GeelyMirror-Phone.apk" if module=="PhoneSender" else f"GeelyMirror-Car.apk"
+        if os.path.exists(apk_path):
+            if os.path.exists(new_name): os.remove(new_name)
+            os.rename(apk_path, new_name)
+            print(f"✅ تم انشاء: {new_name}")
+    print("\\n🎉 انتهى البناء بنجاح!")
+if __name__ == "__main__":
+    build()
+""",
+}
+
+def create():
+    for path, content in FILES.items():
+        full = os.path.join(PROJECT, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        open(full, "w", encoding="utf-8").write(content.strip()+"\n")
+        print(f"تم انشاء: {full}")
+    with zipfile.ZipFile(PROJECT+".zip", \'w\', zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(PROJECT):
+            for file in files:
+                full_path = os.path.join(root, file)
+                z.write(full_path, os.path.relpath(full_path, "."))
+    print(f"\n✅ تم تجهيز المشروع: {PROJECT}.zip")
+    print("1- ادخل للمجلد وشغل: python build.py")
+    print("2- ستحصل على GeelyMirror-Phone.apk و GeelyMirror-Car.apk")
+
+if __name__ == "__main__":
+    create()
